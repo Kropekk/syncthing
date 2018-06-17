@@ -39,6 +39,11 @@ var (
 	listeners = make(map[string]listenerFactory, 0)
 )
 
+var (
+	errDisabled   = errors.New("disabled by configuration")
+	errDeprecated = errors.New("deprecated protocol")
+)
+
 const (
 	perDeviceWarningIntv = 15 * time.Minute
 	tlsHandshakeTimeout  = 10 * time.Second
@@ -149,10 +154,6 @@ func NewService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *
 	return service
 }
 
-var (
-	errDisabled = errors.New("disabled by configuration")
-)
-
 func (s *Service) handle() {
 next:
 	for c := range s.conns {
@@ -163,7 +164,7 @@ next:
 		// because there are implementations out there that don't support
 		// protocol negotiation (iOS for one...).
 		if !cs.NegotiatedProtocolIsMutual || cs.NegotiatedProtocol != s.bepProtocolName {
-			l.Infof("Peer %s did not negotiate bep/1.0", c.RemoteAddr())
+			l.Infof("Peer at %s did not negotiate bep/1.0", c)
 		}
 
 		// We should have received exactly one certificate from the other
@@ -171,7 +172,7 @@ next:
 		// connection.
 		certs := cs.PeerCertificates
 		if cl := len(certs); cl != 1 {
-			l.Infof("Got peer certificate list of length %d != 1 from %s; protocol error", cl, c.RemoteAddr())
+			l.Infof("Got peer certificate list of length %d != 1 from peer at %s; protocol error", cl, c)
 			c.Close()
 			continue
 		}
@@ -182,7 +183,7 @@ next:
 		// though, especially in the presence of NAT hairpinning, multiple
 		// clients between the same NAT gateway, and global discovery.
 		if remoteID == s.myID {
-			l.Infof("Connected to myself (%s) - should not happen", remoteID)
+			l.Infof("Connected to myself (%s) at %s - should not happen", remoteID, c)
 			c.Close()
 			continue
 		}
@@ -206,7 +207,7 @@ next:
 				warningFor(remoteID, msg)
 			} else {
 				// It's something else - connection reset or whatever
-				l.Infof("Failed to exchange Hello messages with %s (%s): %s", remoteID, c.RemoteAddr(), err)
+				l.Infof("Failed to exchange Hello messages with %s at %s: %s", remoteID, c, err)
 			}
 			c.Close()
 			continue
@@ -256,7 +257,7 @@ next:
 			// Incorrect certificate name is something the user most
 			// likely wants to know about, since it's an advanced
 			// config. Warn instead of Info.
-			l.Warnf("Bad certificate from %s (%v): %v", remoteID, c.RemoteAddr(), err)
+			l.Warnf("Bad certificate from %s at %s: %v", remoteID, c, err)
 			c.Close()
 			continue next
 		}
@@ -265,14 +266,12 @@ next:
 		// keep up with config changes to the rate and whether or not LAN
 		// connections are limited.
 		isLAN := s.isLAN(c.RemoteAddr())
-		wr := s.limiter.newWriteLimiter(c, isLAN)
-		rd := s.limiter.newReadLimiter(c, isLAN)
+		rd, wr := s.limiter.getLimiters(remoteID, c, isLAN)
 
-		name := fmt.Sprintf("%s-%s (%s)", c.LocalAddr(), c.RemoteAddr(), c.Type())
-		protoConn := protocol.NewConnection(remoteID, rd, wr, s.model, name, deviceCfg.Compression)
+		protoConn := protocol.NewConnection(remoteID, rd, wr, s.model, c.String(), deviceCfg.Compression)
 		modelConn := completeConn{c, protoConn}
 
-		l.Infof("Established secure connection to %s at %s (%s)", remoteID, name, tlsCipherSuiteNames[c.ConnectionState().CipherSuite])
+		l.Infof("Established secure connection to %s at %s (%s)", remoteID, c, tlsCipherSuiteNames[c.ConnectionState().CipherSuite])
 
 		s.model.AddConnection(modelConn, hello)
 		continue next
@@ -294,7 +293,7 @@ func (s *Service) connect() {
 
 		bestDialerPrio := 1<<31 - 1 // worse prio won't build on 32 bit
 		for _, df := range dialers {
-			if !df.Enabled(cfg) {
+			if df.Valid(cfg) != nil {
 				continue
 			}
 			if prio := df.Priority(); prio < bestDialerPrio {
@@ -341,19 +340,20 @@ func (s *Service) connect() {
 
 			l.Debugln("Reconnect loop for", deviceID, addrs)
 
-			seen = append(seen, addrs...)
-
 			dialTargets := make([]dialTarget, 0)
 
 			for _, addr := range addrs {
-				nextDialAt, ok := nextDial[addr]
+				// Use a special key that is more than just the address, as you might have two devices connected to the same relay
+				nextDialKey := deviceID.String() + "/" + addr
+				seen = append(seen, nextDialKey)
+				nextDialAt, ok := nextDial[nextDialKey]
 				if ok && initialRampup >= sleep && nextDialAt.After(now) {
-					l.Debugf("Not dialing %v as sleep is %v, next dial is at %s and current time is %s", addr, sleep, nextDialAt, now)
+					l.Debugf("Not dialing %s via %v as sleep is %v, next dial is at %s and current time is %s", deviceID, addr, sleep, nextDialAt, now)
 					continue
 				}
 				// If we fail at any step before actually getting the dialer
 				// retry in a minute
-				nextDial[addr] = now.Add(time.Minute)
+				nextDial[nextDialKey] = now.Add(time.Minute)
 
 				uri, err := url.Parse(addr)
 				if err != nil {
@@ -368,13 +368,18 @@ func (s *Service) connect() {
 					}
 				}
 
-				dialerFactory, err := s.getDialerFactory(cfg, uri)
-				if err == errDisabled {
-					l.Debugln(dialerFactory, "for", uri, "is disabled")
+				dialerFactory, err := getDialerFactory(cfg, uri)
+				switch err {
+				case nil:
+					// all good
+				case errDisabled:
+					l.Debugln("Dialer for", uri, "is disabled")
 					continue
-				}
-				if err != nil {
-					l.Infof("%v for %v: %v", dialerFactory, uri, err)
+				case errDeprecated:
+					l.Debugln("Dialer for", uri, "is deprecated")
+					continue
+				default:
+					l.Infof("Dialer for %v: %v", uri, err)
 					continue
 				}
 
@@ -386,7 +391,7 @@ func (s *Service) connect() {
 				}
 
 				dialer := dialerFactory.New(s.cfg, s.tlsCfg)
-				nextDial[addr] = now.Add(dialer.RedialFrequency())
+				nextDial[nextDialKey] = now.Add(dialer.RedialFrequency())
 
 				// For LAN addresses, increase the priority so that we
 				// try these first.
@@ -538,13 +543,18 @@ func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 			continue
 		}
 
-		factory, err := s.getListenerFactory(to, uri)
-		if err == errDisabled {
+		factory, err := getListenerFactory(to, uri)
+		switch err {
+		case nil:
+			// all good
+		case errDisabled:
 			l.Debugln("Listener for", uri, "is disabled")
 			continue
-		}
-		if err != nil {
-			l.Infof("Getting listener factory for %v: %v", uri, err)
+		case errDeprecated:
+			l.Debugln("Listener for", uri, "is deprecated")
+			continue
+		default:
+			l.Infof("Listener for %v: %v", uri, err)
 			continue
 		}
 
@@ -553,7 +563,7 @@ func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 	}
 
 	for addr, listener := range s.listeners {
-		if _, ok := seen[addr]; !ok || !listener.Factory().Enabled(to) {
+		if _, ok := seen[addr]; !ok || listener.Factory().Valid(to) != nil {
 			l.Debugln("Stopping listener", addr)
 			s.listenerSupervisor.Remove(s.listenerTokens[addr])
 			delete(s.listenerTokens, addr)
@@ -634,27 +644,25 @@ func (s *Service) NATType() string {
 	return "unknown"
 }
 
-func (s *Service) getDialerFactory(cfg config.Configuration, uri *url.URL) (dialerFactory, error) {
+func getDialerFactory(cfg config.Configuration, uri *url.URL) (dialerFactory, error) {
 	dialerFactory, ok := dialers[uri.Scheme]
 	if !ok {
 		return nil, fmt.Errorf("unknown address scheme %q", uri.Scheme)
 	}
-
-	if !dialerFactory.Enabled(cfg) {
-		return nil, errDisabled
+	if err := dialerFactory.Valid(cfg); err != nil {
+		return nil, err
 	}
 
 	return dialerFactory, nil
 }
 
-func (s *Service) getListenerFactory(cfg config.Configuration, uri *url.URL) (listenerFactory, error) {
+func getListenerFactory(cfg config.Configuration, uri *url.URL) (listenerFactory, error) {
 	listenerFactory, ok := listeners[uri.Scheme]
 	if !ok {
 		return nil, fmt.Errorf("unknown address scheme %q", uri.Scheme)
 	}
-
-	if !listenerFactory.Enabled(cfg) {
-		return nil, errDisabled
+	if err := listenerFactory.Valid(cfg); err != nil {
+		return nil, err
 	}
 
 	return listenerFactory, nil
@@ -779,11 +787,9 @@ func dialParallel(deviceID protocol.DeviceID, dialTargets []dialTarget) (interna
 		}()
 
 		// Wait for the first connection, or for channel closure.
-		conn, ok := <-res
-
-		// Got a connection, means more might come back, hence spawn a
-		// routine that will do the discarding.
-		if ok {
+		if conn, ok := <-res; ok {
+			// Got a connection, means more might come back, hence spawn a
+			// routine that will do the discarding.
 			l.Debugln("connected to", deviceID, prio, "using", conn, conn.priority)
 			go func(deviceID protocol.DeviceID, prio int) {
 				wg.Wait()
@@ -793,10 +799,9 @@ func dialParallel(deviceID protocol.DeviceID, dialTargets []dialTarget) (interna
 				}
 			}(deviceID, prio)
 			return conn, ok
-		} else {
-			// Failed to connect, report that fact.
-			l.Debugln("failed to connect to", deviceID, prio)
 		}
+		// Failed to connect, report that fact.
+		l.Debugln("failed to connect to", deviceID, prio)
 	}
 	return internalConn{}, false
 }

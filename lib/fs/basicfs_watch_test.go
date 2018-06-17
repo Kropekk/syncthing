@@ -10,15 +10,18 @@ package fs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
-	"github.com/zillode/notify"
+	"github.com/syncthing/notify"
 )
 
 func TestMain(m *testing.M) {
@@ -35,20 +38,20 @@ func TestMain(m *testing.M) {
 		panic("Cannot get real path to working dir")
 	}
 	testDirAbs = filepath.Join(dir, testDir)
-	testFs = newBasicFilesystem(testDirAbs)
-	if l.ShouldDebug("filesystem") {
-		testFs = &logFilesystem{testFs}
-	}
+	testFs = NewFilesystem(FilesystemTypeBasic, testDirAbs)
 
 	backendBuffer = 10
-	defer func() {
-		backendBuffer = 500
-	}()
-	os.Exit(m.Run())
+
+	exitCode := m.Run()
+
+	backendBuffer = 500
+	os.RemoveAll(testDir)
+
+	os.Exit(exitCode)
 }
 
 const (
-	testDir = "temporary_test_root"
+	testDir = "testdata"
 )
 
 var (
@@ -70,8 +73,35 @@ func TestWatchIgnore(t *testing.T) {
 	expectedEvents := []Event{
 		{file, NonRemove},
 	}
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
 
-	testScenario(t, name, testCase, expectedEvents, false, ignored)
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), skipIgnoredDirs: true})
+}
+
+func TestWatchInclude(t *testing.T) {
+	name := "include"
+
+	file := "file"
+	ignored := "ignored"
+	testFs.MkdirAll(filepath.Join(name, ignored), 0777)
+	included := filepath.Join(ignored, "included")
+
+	testCase := func() {
+		createTestFile(name, file)
+		createTestFile(name, included)
+	}
+
+	expectedEvents := []Event{
+		{file, NonRemove},
+		{included, NonRemove},
+	}
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
+
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{ignore: filepath.Join(name, ignored), include: filepath.Join(name, included)})
 }
 
 func TestWatchRename(t *testing.T) {
@@ -94,8 +124,13 @@ func TestWatchRename(t *testing.T) {
 		{old, Remove},
 		destEvent,
 	}
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
 
-	testScenario(t, name, testCase, expectedEvents, false, "")
+	// set the "allow others" flag because we might get the create of
+	// "oldfile" initially
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
 }
 
 // TestWatchOutside checks that no changes from outside the folder make it in
@@ -111,14 +146,25 @@ func TestWatchOutside(t *testing.T) {
 	go func() {
 		defer func() {
 			if recover() == nil {
-				t.Fatalf("Watch did not panic on receiving event outside of folder")
+				select {
+				case <-ctx.Done(): // timed out
+				default:
+					t.Fatalf("Watch did not panic on receiving event outside of folder")
+				}
 			}
 			cancel()
 		}()
-		fs.watchLoop(".", testDirAbs, backendChan, outChan, fakeMatcher{}, ctx)
+		fs.watchLoop(".", backendChan, outChan, fakeMatcher{}, ctx)
 	}()
 
 	backendChan <- fakeEventInfo(filepath.Join(filepath.Dir(testDirAbs), "outside"))
+
+	select {
+	case <-time.After(10 * time.Second):
+		cancel()
+		t.Errorf("Timed out before panicing")
+	case <-ctx.Done():
+	}
 }
 
 func TestWatchSubpath(t *testing.T) {
@@ -131,7 +177,7 @@ func TestWatchSubpath(t *testing.T) {
 	fs := newBasicFilesystem(testDirAbs)
 
 	abs, _ := fs.rooted("sub")
-	go fs.watchLoop("sub", abs, backendChan, outChan, fakeMatcher{}, ctx)
+	go fs.watchLoop("sub", backendChan, outChan, fakeMatcher{}, ctx)
 
 	backendChan <- fakeEventInfo(filepath.Join(abs, "file"))
 
@@ -153,17 +199,128 @@ func TestWatchSubpath(t *testing.T) {
 func TestWatchOverflow(t *testing.T) {
 	name := "overflow"
 
-	testCase := func() {
-		for i := 0; i < 5*backendBuffer; i++ {
-			createTestFile(name, "file"+strconv.Itoa(i))
-		}
-	}
-
 	expectedEvents := []Event{
 		{".", NonRemove},
 	}
 
-	testScenario(t, name, testCase, expectedEvents, true, "")
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
+
+	testCase := func() {
+		for i := 0; i < 5*backendBuffer; i++ {
+			file := "file" + strconv.Itoa(i)
+			createTestFile(name, file)
+			allowedEvents = append(allowedEvents, Event{file, NonRemove})
+		}
+	}
+
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
+}
+
+func TestWatchErrorLinuxInterpretation(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("testing of linux specific error codes")
+	}
+
+	var errTooManyFiles = &os.PathError{
+		Op:   "error while traversing",
+		Path: "foo",
+		Err:  syscall.Errno(24),
+	}
+	var errNoSpace = &os.PathError{
+		Op:   "error while traversing",
+		Path: "bar",
+		Err:  syscall.Errno(28),
+	}
+
+	if !reachedMaxUserWatches(errTooManyFiles) {
+		t.Error("Underlying error syscall.Errno(24) should be recognised to be about inotify limits.")
+	}
+	if !reachedMaxUserWatches(errNoSpace) {
+		t.Error("Underlying error syscall.Errno(28) should be recognised to be about inotify limits.")
+	}
+	err := errors.New("Another error")
+	if reachedMaxUserWatches(err) {
+		t.Errorf("This error does not concern inotify limits: %#v", err)
+	}
+}
+
+func TestWatchSymlinkedRoot(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Involves symlinks")
+	}
+
+	name := "symlinkedRoot"
+	if err := testFs.MkdirAll(name, 0755); err != nil {
+		panic(fmt.Sprintf("Failed to create directory %s: %s", name, err))
+	}
+	defer testFs.RemoveAll(name)
+
+	root := filepath.Join(name, "root")
+	if err := testFs.MkdirAll(root, 0777); err != nil {
+		panic(err)
+	}
+	link := filepath.Join(name, "link")
+
+	if err := testFs.CreateSymlink(filepath.Join(testFs.URI(), root), link); err != nil {
+		panic(err)
+	}
+
+	linkedFs := NewFilesystem(FilesystemTypeBasic, filepath.Join(testFs.URI(), link))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := linkedFs.Watch(".", fakeMatcher{}, ctx, false); err != nil {
+		panic(err)
+	}
+
+	if err := linkedFs.MkdirAll("foo", 0777); err != nil {
+		panic(err)
+	}
+
+	// Give the panic some time to happen
+	sleepMs(100)
+}
+
+func TestUnrootedChecked(t *testing.T) {
+	var unrooted string
+	defer func() {
+		if recover() == nil {
+			t.Fatal("unrootedChecked did not panic on outside path, but returned", unrooted)
+		}
+	}()
+	fs := newBasicFilesystem(testDirAbs)
+	unrooted = fs.unrootedChecked("/random/other/path")
+}
+
+func TestWatchIssue4877(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows specific test")
+	}
+
+	name := "Issue4877"
+
+	file := "file"
+
+	testCase := func() {
+		createTestFile(name, file)
+	}
+
+	expectedEvents := []Event{
+		{file, NonRemove},
+	}
+	allowedEvents := []Event{
+		{name, NonRemove},
+	}
+
+	origTestFs := testFs
+	testFs = NewFilesystem(FilesystemTypeBasic, strings.ToLower(testDirAbs[:1])+strings.ToUpper(testDirAbs[1:]))
+	defer func() {
+		testFs = origTestFs
+	}()
+
+	testScenario(t, name, testCase, expectedEvents, allowedEvents, fakeMatcher{})
 }
 
 // path relative to folder root, also creates parent dirs if necessary
@@ -192,53 +349,33 @@ func sleepMs(ms int) {
 	time.Sleep(time.Duration(ms) * time.Millisecond)
 }
 
-func testScenario(t *testing.T, name string, testCase func(), expectedEvents []Event, allowOthers bool, ignored string) {
+func testScenario(t *testing.T, name string, testCase func(), expectedEvents, allowedEvents []Event, fm fakeMatcher) {
 	if err := testFs.MkdirAll(name, 0755); err != nil {
 		panic(fmt.Sprintf("Failed to create directory %s: %s", name, err))
 	}
-
-	// Tests pick up the previously created files/dirs, probably because
-	// they get flushed to disk with a delay.
-	initDelayMs := 500
-	if runtime.GOOS == "darwin" {
-		initDelayMs = 2000
-	}
-	sleepMs(initDelayMs)
+	defer testFs.RemoveAll(name)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	if ignored != "" {
-		ignored = filepath.Join(name, ignored)
-	}
-
-	eventChan, err := testFs.Watch(name, fakeMatcher{ignored}, ctx, false)
+	eventChan, err := testFs.Watch(name, fm, ctx, false)
 	if err != nil {
 		panic(err)
 	}
 
-	go testWatchOutput(t, name, eventChan, expectedEvents, allowOthers, ctx, cancel)
-
-	timeoutDuration := 2 * time.Second
-	if runtime.GOOS == "darwin" {
-		timeoutDuration *= 2
-	}
-	timeout := time.NewTimer(timeoutDuration)
+	go testWatchOutput(t, name, eventChan, expectedEvents, allowedEvents, ctx, cancel)
 
 	testCase()
 
 	select {
-	case <-timeout.C:
+	case <-time.After(time.Minute):
 		t.Errorf("Timed out before receiving all expected events")
-		cancel()
-	case <-ctx.Done():
-	}
 
-	if err := testFs.RemoveAll(name); err != nil {
-		panic(fmt.Sprintf("Failed to remove directory %s: %s", name, err))
+	case <-ctx.Done():
 	}
 }
 
-func testWatchOutput(t *testing.T, name string, in <-chan Event, expectedEvents []Event, allowOthers bool, ctx context.Context, cancel context.CancelFunc) {
+func testWatchOutput(t *testing.T, name string, in <-chan Event, expectedEvents, allowedEvents []Event, ctx context.Context, cancel context.CancelFunc) {
 	var expected = make(map[Event]struct{})
 	for _, ev := range expectedEvents {
 		ev.Name = filepath.Join(name, ev.Name)
@@ -265,7 +402,7 @@ func testWatchOutput(t *testing.T, name string, in <-chan Event, expectedEvents 
 		}
 
 		if _, ok := expected[received]; !ok {
-			if allowOthers {
+			if len(allowedEvents) > 0 {
 				sleepMs(100) // To facilitate overflow
 				continue
 			}
@@ -278,10 +415,19 @@ func testWatchOutput(t *testing.T, name string, in <-chan Event, expectedEvents 
 	}
 }
 
-type fakeMatcher struct{ match string }
+// Matches are done via direct comparison against both ignore and include
+type fakeMatcher struct {
+	ignore          string
+	include         string
+	skipIgnoredDirs bool
+}
 
 func (fm fakeMatcher) ShouldIgnore(name string) bool {
-	return name == fm.match
+	return name != fm.include && name == fm.ignore
+}
+
+func (fm fakeMatcher) SkipIgnoredDirs() bool {
+	return fm.skipIgnoredDirs
 }
 
 type fakeEventInfo string

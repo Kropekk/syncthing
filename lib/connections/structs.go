@@ -28,6 +28,7 @@ type Connection interface {
 	Transport() string
 	RemoteAddr() net.Addr
 	Priority() int
+	String() string
 }
 
 // completeConn is the aggregation of an internalConn and the
@@ -53,8 +54,6 @@ const (
 	connTypeRelayServer
 	connTypeTCPClient
 	connTypeTCPServer
-	connTypeKCPClient
-	connTypeKCPServer
 )
 
 func (t connType) String() string {
@@ -67,10 +66,6 @@ func (t connType) String() string {
 		return "tcp-client"
 	case connTypeTCPServer:
 		return "tcp-server"
-	case connTypeKCPClient:
-		return "kcp-client"
-	case connTypeKCPServer:
-		return "kcp-server"
 	default:
 		return "unknown-type"
 	}
@@ -82,8 +77,6 @@ func (t connType) Transport() string {
 		return "relay"
 	case connTypeTCPClient, connTypeTCPServer:
 		return "tcp"
-	case connTypeKCPClient, connTypeKCPServer:
-		return "kcp"
 	default:
 		return "unknown"
 	}
@@ -114,14 +107,14 @@ func (c internalConn) Transport() string {
 }
 
 func (c internalConn) String() string {
-	return fmt.Sprintf("%s-%s/%s", c.LocalAddr(), c.RemoteAddr(), c.connType.String())
+	return fmt.Sprintf("%s-%s/%s", c.LocalAddr(), c.RemoteAddr(), c.Type())
 }
 
 type dialerFactory interface {
 	New(*config.Wrapper, *tls.Config) genericDialer
 	Priority() int
 	AlwaysWAN() bool
-	Enabled(config.Configuration) bool
+	Valid(config.Configuration) error
 	String() string
 }
 
@@ -132,7 +125,7 @@ type genericDialer interface {
 
 type listenerFactory interface {
 	New(*url.URL, *config.Wrapper, *tls.Config, chan internalConn, *nat.Service) genericListener
-	Enabled(config.Configuration) bool
+	Valid(config.Configuration) error
 }
 
 type genericListener interface {

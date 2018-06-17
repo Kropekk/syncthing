@@ -60,7 +60,7 @@ func (c *folderSummaryService) Stop() {
 // listenForUpdates subscribes to the event bus and makes note of folders that
 // need their data recalculated.
 func (c *folderSummaryService) listenForUpdates() {
-	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected)
+	sub := events.Default.Subscribe(events.LocalIndexUpdated | events.RemoteIndexUpdated | events.StateChanged | events.RemoteDownloadProgress | events.DeviceConnected | events.FolderWatchStateChanged)
 	defer events.Default.Unsubscribe(sub)
 
 	for {
@@ -105,14 +105,14 @@ func (c *folderSummaryService) listenForUpdates() {
 					// c.immediate must be nonblocking so that we can continue
 					// handling events.
 
+					c.foldersMut.Lock()
 					select {
 					case c.immediate <- folder:
-						c.foldersMut.Lock()
 						delete(c.folders, folder)
-						c.foldersMut.Unlock()
-
 					default:
+						c.folders[folder] = struct{}{}
 					}
+					c.foldersMut.Unlock()
 				}
 
 			default:
@@ -187,7 +187,10 @@ func (c *folderSummaryService) foldersToHandle() []string {
 func (c *folderSummaryService) sendSummary(folder string) {
 	// The folder summary contains how many bytes, files etc
 	// are in the folder and how in sync we are.
-	data := folderSummary(c.cfg, c.model, folder)
+	data, err := folderSummary(c.cfg, c.model, folder)
+	if err != nil {
+		return
+	}
 	events.Default.Log(events.FolderSummary, map[string]interface{}{
 		"folder":  folder,
 		"summary": data,
@@ -205,15 +208,10 @@ func (c *folderSummaryService) sendSummary(folder string) {
 
 		// Get completion percentage of this folder for the
 		// remote device.
-		comp := c.model.Completion(devCfg.DeviceID, folder)
-		events.Default.Log(events.FolderCompletion, map[string]interface{}{
-			"folder":      folder,
-			"device":      devCfg.DeviceID.String(),
-			"completion":  comp.CompletionPct,
-			"needBytes":   comp.NeedBytes,
-			"needItems":   comp.NeedItems,
-			"globalBytes": comp.GlobalBytes,
-		})
+		comp := jsonCompletion(c.model.Completion(devCfg.DeviceID, folder))
+		comp["folder"] = folder
+		comp["device"] = devCfg.DeviceID.String()
+		events.Default.Log(events.FolderCompletion, comp)
 	}
 }
 

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 )
@@ -28,21 +29,8 @@ func (BasicFilesystem) ReadSymlink(path string) (string, error) {
 	return "", errNotSupported
 }
 
-func (BasicFilesystem) CreateSymlink(path, target string) error {
+func (BasicFilesystem) CreateSymlink(target, name string) error {
 	return errNotSupported
-}
-
-// MkdirAll creates a directory named path, along with any necessary parents,
-// and returns nil, or else returns an error.
-// The permission bits perm are used for all directories that MkdirAll creates.
-// If path is already a directory, MkdirAll does nothing and returns nil.
-func (f *BasicFilesystem) MkdirAll(path string, perm FileMode) error {
-	path, err := f.rooted(path)
-	if err != nil {
-		return err
-	}
-
-	return f.mkdirAll(path, os.FileMode(perm))
 }
 
 // Required due to https://github.com/golang/go/issues/10900
@@ -75,7 +63,7 @@ func (f *BasicFilesystem) mkdirAll(path string, perm os.FileMode) error {
 		// Create parent
 		parent := path[0 : j-1]
 		if parent != filepath.VolumeName(parent) {
-			err = os.MkdirAll(parent, perm)
+			err = f.mkdirAll(parent, perm)
 			if err != nil {
 				return err
 			}
@@ -162,4 +150,40 @@ func (f *BasicFilesystem) Roots() ([]string, error) {
 	}
 
 	return drives, nil
+}
+
+func (f *BasicFilesystem) resolveWin83(absPath string) string {
+	if !isMaybeWin83(absPath) {
+		return absPath
+	}
+	if in, err := syscall.UTF16FromString(absPath); err == nil {
+		out := make([]uint16, 4*len(absPath)) // *2 for UTF16 and *2 to double path length
+		if n, err := syscall.GetLongPathName(&in[0], &out[0], uint32(len(out))); err == nil {
+			if n <= uint32(len(out)) {
+				return syscall.UTF16ToString(out[:n])
+			}
+			out = make([]uint16, n)
+			if _, err = syscall.GetLongPathName(&in[0], &out[0], n); err == nil {
+				return syscall.UTF16ToString(out)
+			}
+		}
+	}
+	// Failed getting the long path. Return the part of the path which is
+	// already a long path.
+	for absPath = filepath.Dir(absPath); strings.HasPrefix(absPath, f.rootSymlinkEvaluated); absPath = filepath.Dir(absPath) {
+		if !isMaybeWin83(absPath) {
+			return absPath
+		}
+	}
+	return f.rootSymlinkEvaluated
+}
+
+func isMaybeWin83(absPath string) bool {
+	if !strings.Contains(absPath, "~") {
+		return false
+	}
+	if strings.Contains(filepath.Dir(absPath), "~") {
+		return true
+	}
+	return strings.Contains(strings.TrimPrefix(filepath.Base(absPath), WindowsTempPrefix), "~")
 }

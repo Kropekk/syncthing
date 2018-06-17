@@ -26,7 +26,6 @@ import (
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/scanner"
 	"github.com/syncthing/syncthing/lib/upgrade"
-	"github.com/syncthing/syncthing/lib/weakhash"
 )
 
 // Current version number of the usage report, for acceptance purposes. If
@@ -80,7 +79,8 @@ func reportData(cfg configIntf, m modelIntf, connectionsService connectionsIntf,
 
 	var rescanIntvs []int
 	folderUses := map[string]int{
-		"readonly":            0,
+		"sendonly":            0,
+		"sendreceive":         0,
 		"ignorePerms":         0,
 		"ignoreDelete":        0,
 		"autoNormalize":       0,
@@ -92,8 +92,11 @@ func reportData(cfg configIntf, m modelIntf, connectionsService connectionsIntf,
 	for _, cfg := range cfg.Folders() {
 		rescanIntvs = append(rescanIntvs, cfg.RescanIntervalS)
 
-		if cfg.Type == config.FolderTypeSendOnly {
-			folderUses["readonly"]++
+		switch cfg.Type {
+		case config.FolderTypeSendOnly:
+			folderUses["sendonly"]++
+		case config.FolderTypeSendReceive:
+			folderUses["sendreceive"]++
 		}
 		if cfg.IgnorePerms {
 			folderUses["ignorePerms"]++
@@ -190,8 +193,6 @@ func reportData(cfg configIntf, m modelIntf, connectionsService connectionsIntf,
 		res["overwriteRemoteDeviceNames"] = opts.OverwriteRemoteDevNames
 		res["progressEmitterEnabled"] = opts.ProgressUpdateIntervalS > -1
 		res["customDefaultFolderPath"] = opts.DefaultFolderPath != "~"
-		res["weakHashSelection"] = opts.WeakHashSelectionMethod.String()
-		res["weakHashEnabled"] = weakhash.Enabled
 		res["customTrafficClass"] = opts.TrafficClass != 0
 		res["customTempIndexMinBlocks"] = opts.TempIndexMinBlocks != 10
 		res["temporariesDisabled"] = opts.KeepTemporariesH == 0
@@ -199,7 +200,6 @@ func reportData(cfg configIntf, m modelIntf, connectionsService connectionsIntf,
 		res["limitBandwidthInLan"] = opts.LimitBandwidthInLan
 		res["customReleaseURL"] = opts.ReleasesURL != "https://upgrades.syncthing.net/meta.json"
 		res["restartOnWakeup"] = opts.RestartOnWakeup
-		res["customStunServers"] = len(opts.StunServers) == 0 || opts.StunServers[0] != "default" || len(opts.StunServers) > 1
 
 		folderUsesV3 := map[string]int{
 			"scanProgressDisabled":    0,
@@ -400,7 +400,7 @@ func (usageReportingService) String() string {
 
 // cpuBench returns CPU performance as a measure of single threaded SHA-256 MiB/s
 func cpuBench(iterations int, duration time.Duration, useWeakHash bool) float64 {
-	dataSize := 16 * protocol.BlockSize
+	dataSize := 16 * protocol.MinBlockSize
 	bs := make([]byte, dataSize)
 	rand.Reader.Read(bs)
 
@@ -421,7 +421,7 @@ func cpuBenchOnce(duration time.Duration, useWeakHash bool, bs []byte) float64 {
 	b := 0
 	for time.Since(t0) < duration {
 		r := bytes.NewReader(bs)
-		blocksResult, _ = scanner.Blocks(context.TODO(), r, protocol.BlockSize, int64(len(bs)), nil, useWeakHash)
+		blocksResult, _ = scanner.Blocks(context.TODO(), r, protocol.MinBlockSize, int64(len(bs)), nil, useWeakHash)
 		b += len(bs)
 	}
 	d := time.Since(t0)
