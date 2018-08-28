@@ -129,7 +129,7 @@ var targets = map[string]target{
 		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "cmd/stdiscosrv/README.md", dst: "deb/usr/share/doc/syncthing-discosrv/README.txt", perm: 0644},
-			{src: "cmd/stdiscosrv/LICENSE", dst: "deb/usr/share/doc/syncthing-discosrv/LICENSE.txt", perm: 0644},
+			{src: "LICENSE", dst: "deb/usr/share/doc/syncthing-discosrv/LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "deb/usr/share/doc/syncthing-discosrv/AUTHORS.txt", perm: 0644},
 			{src: "man/stdiscosrv.1", dst: "deb/usr/share/man/man1/stdiscosrv.1", perm: 0644},
 		},
@@ -146,12 +146,14 @@ var targets = map[string]target{
 			{src: "{{binary}}", dst: "{{binary}}", perm: 0755},
 			{src: "cmd/strelaysrv/README.md", dst: "README.txt", perm: 0644},
 			{src: "cmd/strelaysrv/LICENSE", dst: "LICENSE.txt", perm: 0644},
+			{src: "LICENSE", dst: "LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "AUTHORS.txt", perm: 0644},
 		},
 		installationFiles: []archiveFile{
 			{src: "{{binary}}", dst: "deb/usr/bin/{{binary}}", perm: 0755},
 			{src: "cmd/strelaysrv/README.md", dst: "deb/usr/share/doc/syncthing-relaysrv/README.txt", perm: 0644},
 			{src: "cmd/strelaysrv/LICENSE", dst: "deb/usr/share/doc/syncthing-relaysrv/LICENSE.txt", perm: 0644},
+			{src: "LICENSE", dst: "deb/usr/share/doc/syncthing-relaysrv/LICENSE.txt", perm: 0644},
 			{src: "AUTHORS", dst: "deb/usr/share/doc/syncthing-relaysrv/AUTHORS.txt", perm: 0644},
 			{src: "man/strelaysrv.1", dst: "deb/usr/share/man/man1/strelaysrv.1", perm: 0644},
 		},
@@ -211,14 +213,14 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
+		os.Setenv("GOPATH", gopath)
+		log.Println("GOPATH is", gopath)
 		if !noBuildGopath {
-			lazyRebuildAssets()
 			if err := buildGOPATH(gopath); err != nil {
 				log.Fatal(err)
 			}
+			lazyRebuildAssets()
 		}
-		os.Setenv("GOPATH", gopath)
-		log.Println("GOPATH is", gopath)
 	} else {
 		inside := false
 		wd, _ := os.Getwd()
@@ -618,6 +620,8 @@ func buildSnap(target target) {
 	snaparch := goarch
 	if snaparch == "armhf" {
 		goarch = "arm"
+	} else if snaparch == "i386" {
+		goarch = "386"
 	}
 	snapver := version
 	if strings.HasPrefix(snapver, "v") {
@@ -628,9 +632,10 @@ func buildSnap(target target) {
 		snapgrade = "stable"
 	}
 	err = tmpl.Execute(f, map[string]string{
-		"Version":      snapver,
-		"Architecture": snaparch,
-		"Grade":        snapgrade,
+		"Version":            snapver,
+		"HostArchitecture":   runtime.GOARCH,
+		"TargetArchitecture": snaparch,
+		"Grade":              snapgrade,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -738,12 +743,11 @@ func listFiles(dir string) []string {
 
 func rebuildAssets() {
 	os.Setenv("SOURCE_DATE_EPOCH", fmt.Sprint(buildStamp()))
-	runPipe("lib/auto/gui.files.go", "go", "run", "script/genassets.go", "gui")
-	runPipe("cmd/strelaypoolsrv/auto/gui.go", "go", "run", "script/genassets.go", "cmd/strelaypoolsrv/gui")
+	runPrint("go", "generate", "github.com/syncthing/syncthing/lib/auto", "github.com/syncthing/syncthing/cmd/strelaypoolsrv/auto")
 }
 
 func lazyRebuildAssets() {
-	if shouldRebuildAssets("lib/auto/gui.files.go", "gui") || shouldRebuildAssets("cmd/strelaypoolsrv/auto/gui.go", "cmd/strelaypoolsrv/auto/gui") {
+	if shouldRebuildAssets("lib/auto/gui.files.go", "gui") || shouldRebuildAssets("cmd/strelaypoolsrv/auto/gui.files.go", "cmd/strelaypoolsrv/auto/gui") {
 		rebuildAssets()
 	}
 }
@@ -1258,7 +1262,7 @@ func temporaryBuildDir() (string, error) {
 
 func buildGOPATH(gopath string) error {
 	pkg := filepath.Join(gopath, "src/github.com/syncthing/syncthing")
-	dirs := []string{"cmd", "lib", "meta", "script", "test", "vendor"}
+	dirs := []string{"cmd", "gui", "lib", "meta", "script", "test", "vendor"}
 
 	if debug {
 		t0 := time.Now()

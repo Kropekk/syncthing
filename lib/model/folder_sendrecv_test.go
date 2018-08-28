@@ -74,12 +74,12 @@ func setUpFile(filename string, blockNumbers []int) protocol.FileInfo {
 	}
 }
 
-func setUpModel(file protocol.FileInfo) *Model {
+func setUpModel(files ...protocol.FileInfo) *Model {
 	db := db.OpenMemory()
 	model := NewModel(defaultCfgWrapper, protocol.LocalDeviceID, "syncthing", "dev", db, nil)
 	model.AddFolder(defaultFolderConfig)
 	// Update index
-	model.updateLocalsFromScanning("default", []protocol.FileInfo{file})
+	model.updateLocalsFromScanning("default", files)
 	return model
 }
 
@@ -91,15 +91,17 @@ func setUpSendReceiveFolder(model *Model) *sendReceiveFolder {
 			initialScanFinished: make(chan struct{}),
 			ctx:                 context.TODO(),
 			FolderConfiguration: config.FolderConfiguration{
+				FilesystemType:      fs.FilesystemTypeBasic,
+				Path:                "testdata",
 				PullerMaxPendingKiB: defaultPullerPendingKiB,
 			},
 		},
 
-		fs:        fs.NewMtimeFS(fs.NewFilesystem(fs.FilesystemTypeBasic, "testdata"), db.NewNamespacedKV(model.db, "mtime")),
 		queue:     newJobQueue(),
 		errors:    make(map[string]string),
 		errorsMut: sync.NewMutex(),
 	}
+	f.fs = fs.NewMtimeFS(f.Filesystem(), db.NewNamespacedKV(model.db, "mtime"))
 
 	// Folders are never actually started, so no initial scan will be done
 	close(f.initialScanFinished)
